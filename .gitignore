@@ -1,0 +1,54 @@
+# Dependencies and generated output
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+build/
+**/build/
+target/
+coverage/
+.cache/
+*.cache
+*.log
+logs/
+tmp/
+temp/
+
+# Local data and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*secret*
+*credential*
+*token*
+
+# Local Claude/QA/trajectory artifacts
+CLAUDE.md
+.claude/
+memory/
+**/memory/
+skill/
+skills/
+**/skill/
+**/skills/
+*_traces/
+*.jsonl
+qa/
+QA/
+qa-report*
+*qa_report*
+.playwright-cli/
+
+# Editors and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp

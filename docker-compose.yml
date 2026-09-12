@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: senior
+      POSTGRES_PASSWORD: senior123
+      POSTGRES_DB: senior_university
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U senior -d senior_university"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    # 数据库不发布到宿主端口，仅供 compose 内部网络访问
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://senior:senior123@db:5432/senior_university
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+    ports:
+      # 仅应用服务发布到宿主端口（宿主机端口由 CC_PUBLISH_PORT 注入）
+      - "${CC_PUBLISH_PORT}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  db_data:

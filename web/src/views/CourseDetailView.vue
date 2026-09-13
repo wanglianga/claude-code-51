@@ -28,12 +28,15 @@
       <el-tabs v-model="tab">
         <!-- 名单 -->
         <el-tab-pane label="报名名单" name="roster">
-          <el-card shadow="never">
+          <el-card shadow="never" style="margin-bottom: 12px">
             <el-table :data="enrollments" size="small">
               <el-table-column prop="student_name" label="学员" width="90" />
               <el-table-column prop="age" label="年龄" width="60" />
+              <el-table-column label="座位" width="60">
+                <template #default="{ row }">{{ row.seat_no ?? '—' }}</template>
+              </el-table-column>
               <el-table-column prop="level" label="基础水平" width="80" />
-              <el-table-column prop="health_limits" label="健康限制" width="130" show-overflow-tooltip />
+              <el-table-column prop="health_limits" label="健康限制" width="120" show-overflow-tooltip />
               <el-table-column prop="source" label="报名来源" width="90" />
               <el-table-column label="缴费" width="80">
                 <template #default="{ row }">
@@ -47,7 +50,7 @@
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="教师评价" min-width="160">
+              <el-table-column label="教师评价" min-width="150">
                 <template #default="{ row }">
                   <span v-if="row.eval_rating">
                     <el-rate :model-value="row.eval_rating" disabled size="small" style="display: inline-flex" />
@@ -56,17 +59,58 @@
                   <span v-else style="color: #c0c4cc">未评价</span>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="220" fixed="right">
+              <el-table-column label="操作" width="250" fixed="right">
                 <template #default="{ row }">
                   <template v-if="auth.canManage">
                     <el-button v-if="row.fee_status === '未缴'" link type="success" size="small" @click="pay(row)">缴费</el-button>
                     <el-button v-if="row.status === '候补'" link type="primary" size="small" @click="promote(row)">转正</el-button>
+                    <el-button v-if="row.status === '已录取'" link type="warning" size="small" @click="longLeave(row)">长期请假</el-button>
+                    <el-button v-if="row.status === '长期请假'" link type="success" size="small" @click="restore(row)">恢复</el-button>
                     <el-button v-if="['已录取', '候补'].includes(row.status)" link type="danger" size="small" @click="drop(row)">退课</el-button>
                   </template>
                   <el-button v-if="row.status === '已录取'" link type="warning" size="small" @click="openEval(row)">评价</el-button>
                 </template>
               </el-table-column>
             </el-table>
+          </el-card>
+
+          <!-- 候补转正通知 -->
+          <el-card shadow="never">
+            <template #header>
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <b>候补转正通知</b>
+                <el-button
+                  v-if="auth.canManage && (course.counts?.waitlist ?? 0) > 0"
+                  size="small" type="primary" plain
+                  @click="pushOffer"
+                >按顺序推送转正通知</el-button>
+              </div>
+            </template>
+            <el-table :data="offers" size="small">
+              <el-table-column prop="student_name" label="学员" width="90" />
+              <el-table-column label="候补位次" width="80">
+                <template #default="{ row }">第{{ row.queue_position }}位</template>
+              </el-table-column>
+              <el-table-column prop="level" label="基础水平" width="80" />
+              <el-table-column prop="note" label="名额来源" min-width="180" show-overflow-tooltip />
+              <el-table-column label="状态" width="80">
+                <template #default="{ row }">
+                  <el-tag :type="offerType(row.status)" size="small">{{ row.status }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="reason" label="顺延/过期原因" min-width="160" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.reason || '—' }}</template>
+              </el-table-column>
+              <el-table-column label="操作" width="150">
+                <template #default="{ row }">
+                  <template v-if="row.status === '待确认' && auth.canManage">
+                    <el-button link type="success" size="small" @click="confirmOffer(row)">确认转正</el-button>
+                    <el-button link type="warning" size="small" @click="declineOffer(row)">顺延</el-button>
+                  </template>
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-empty v-if="!offers.length" description="暂无转正通知（退课/长期请假空出名额时自动按候补顺序推送）" :image-size="60" />
           </el-card>
         </el-tab-pane>
 
@@ -294,6 +338,7 @@ const loading = ref(false);
 const course = ref<any>(null);
 const enrollments = ref<any[]>([]);
 const sessions = ref<any[]>([]);
+const offers = ref<any[]>([]);
 const precheck = ref<any>(null);
 const precheckLoading = ref(false);
 const tab = ref('roster');
@@ -318,20 +363,25 @@ function feeType(s: string) {
   return { 已缴: 'success', 未缴: 'danger', 部分退: 'warning', 已退: 'info' }[s] as any;
 }
 function enrollType(s: string) {
-  return { 已录取: 'success', 候补: 'warning', 已退课: 'info', 已转班: 'info' }[s] as any;
+  return { 已录取: 'success', 候补: 'warning', 长期请假: 'warning', 已退课: 'info', 已转班: 'info' }[s] as any;
+}
+function offerType(s: string) {
+  return { 待确认: 'warning', 已确认: 'success', 已顺延: 'info', 已过期: 'info', 已取消: 'info' }[s] as any;
 }
 
 async function load() {
   loading.value = true;
   try {
-    const [c, e, s] = await Promise.all([
+    const [c, e, s, o] = await Promise.all([
       api.get(`/courses/${id}`),
       api.get(`/courses/${id}/enrollments`),
       api.get(`/courses/${id}/sessions`),
+      api.get('/offers', { params: { course_id: id } }),
     ]);
     course.value = c.data;
     enrollments.value = e.data;
     sessions.value = s.data;
+    offers.value = o.data;
   } finally {
     loading.value = false;
   }
@@ -442,12 +492,79 @@ async function promote(row: any) {
 async function drop(row: any) {
   try {
     const { value } = await ElMessageBox.prompt(
-      `确认 ${row.student_name} 退出「${course.value.title}」？已缴费将自动生成退费申请，空出名额按候补顺序递补。`,
+      `确认 ${row.student_name} 退出「${course.value.title}」？已缴费将自动生成退费申请，空出名额按候补顺序自动推送转正通知。`,
       '学员退课',
       { inputPlaceholder: '退课原因', inputValue: '学员主动退课', inputValidator: (v) => !!v || '请填写原因' }
     );
-    await api.post(`/enrollments/${row.id}/cancel`, { reason: value });
-    ElMessage.success('已退课');
+    const { data } = await api.post(`/enrollments/${row.id}/cancel`, { reason: value });
+    ElMessage.success(data.offers?.length ? `已退课，已自动推送${data.offers.length}条转正通知` : '已退课');
+    load();
+  } catch (e: any) {
+    if (e?.response) ElMessage.error(errMsg(e));
+  }
+}
+
+async function longLeave(row: any) {
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `将 ${row.student_name} 标记为长期请假？名额临时空出并自动推送转正通知。`,
+      '长期请假',
+      { inputPlaceholder: '如：去外地子女家休养两个月', inputValidator: (v) => !!v || '请填写原因' }
+    );
+    const { data } = await api.post(`/enrollments/${row.id}/long-leave`, { reason: value });
+    ElMessage.success(data.offers?.length ? `已标记，已自动推送${data.offers.length}条转正通知` : '已标记长期请假');
+    load();
+  } catch (e: any) {
+    if (e?.response) ElMessage.error(errMsg(e));
+  }
+}
+
+async function restore(row: any) {
+  try {
+    const { data } = await api.post(`/enrollments/${row.id}/restore`);
+    ElMessage.success(data.status === '已录取' ? `已恢复，座位${data.seat}号` : `课程已满，排到候补第${data.position}位`);
+    load();
+  } catch (e) {
+    ElMessage.error(errMsg(e));
+  }
+}
+
+async function pushOffer() {
+  try {
+    const { data } = await api.post(`/offers/course/${id}`, { note: '工作人员手动推送转正通知' });
+    ElMessage.success(`已推送${data.created.length}条转正通知`);
+    load();
+  } catch (e) {
+    ElMessage.error(errMsg(e));
+  }
+}
+
+async function confirmOffer(row: any) {
+  try {
+    await ElMessageBox.confirm(
+      `确认 ${row.student_name} 转正？将同步分配座位、更新缴费状态与教师名单，并检查教材库存。`,
+      '确认转正',
+      { type: 'success' }
+    );
+    const { data } = await api.post(`/offers/${row.id}/confirm`);
+    ElMessage.success(
+      `转正成功：座位${data.seat_no}号${data.fee_due > 0 ? `，待缴费${data.fee_due}元` : '，费用已缴清'}` +
+        (data.material_warnings?.length ? `；⚠️ ${data.material_warnings.join('；')}` : '')
+    );
+    load();
+  } catch (e: any) {
+    if (e?.response) ElMessage.error(errMsg(e));
+  }
+}
+
+async function declineOffer(row: any) {
+  try {
+    const { value } = await ElMessageBox.prompt('未确认原因（保留在档案中，并自动顺延下一位）：', '未确认顺延', {
+      inputPlaceholder: '如：去外地子女家，本月无法到校',
+      inputValidator: (v) => !!v || '请填写原因',
+    });
+    const { data } = await api.post(`/offers/${row.id}/decline`, { reason: value });
+    ElMessage.success(data.next?.length ? '已顺延，并自动推送下一位' : '已顺延（暂无可推送的候补）');
     load();
   } catch (e: any) {
     if (e?.response) ElMessage.error(errMsg(e));

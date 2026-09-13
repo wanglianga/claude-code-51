@@ -275,3 +275,27 @@ CREATE INDEX IF NOT EXISTS idx_audit_course ON audit_logs(course_id);
 CREATE INDEX IF NOT EXISTS idx_audit_student ON audit_logs(student_id);
 CREATE INDEX IF NOT EXISTS idx_bookings_room_date ON room_bookings(room_id, booking_date);
 CREATE INDEX IF NOT EXISTS idx_material_logs_mid ON material_logs(material_id);
+
+-- ============ 候补转正通知与报名校验（增量） ============
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS seat_no INT;              -- 座位号
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS proxy_name TEXT DEFAULT '';    -- 家属代办人
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS proxy_relation TEXT DEFAULT ''; -- 代办关系
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS proxy_phone TEXT DEFAULT '';   -- 代办人电话
+
+CREATE TABLE IF NOT EXISTS promotion_offers (
+  id SERIAL PRIMARY KEY,
+  course_id INT NOT NULL REFERENCES courses(id),
+  enrollment_id INT NOT NULL REFERENCES enrollments(id),
+  student_id INT NOT NULL REFERENCES students(id),
+  queue_position INT,                      -- 推送时的候补位次
+  level TEXT DEFAULT '',                   -- 基础水平（推送快照）
+  status TEXT NOT NULL DEFAULT '待确认',    -- 待确认/已确认/已顺延/已过期/已取消
+  reason TEXT DEFAULT '',                  -- 顺延/过期原因（保留）
+  note TEXT DEFAULT '',                    -- 推送备注（名额来源：退课/长期请假）
+  offered_by TEXT DEFAULT '系统',
+  offered_at TIMESTAMPTZ DEFAULT now(),
+  expires_at TIMESTAMPTZ,                  -- 48小时确认期限
+  responded_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_offers_course ON promotion_offers(course_id);
+CREATE INDEX IF NOT EXISTS idx_offers_enrollment ON promotion_offers(enrollment_id);

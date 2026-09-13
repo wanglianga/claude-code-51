@@ -3,7 +3,17 @@ import { query, one, withTransaction } from '../db';
 import { h, bad, str, num } from '../helpers';
 import { requireStaff } from '../auth';
 import { audit } from '../audit';
-import { confirmedCount, promoteNext, ageOf } from '../domain';
+import {
+  assignSeat,
+  confirmedCount,
+  findTimeConflict,
+  offerNextSeats,
+  ageOf,
+  AGE_MIN,
+  AGE_MAX,
+  DANCE_AGE_MAX,
+  HOT_WAITLIST_THRESHOLD,
+} from '../domain';
 
 export const enrollmentsRouter = Router();
 export const leavesRouter = Router();
@@ -47,6 +57,29 @@ enrollmentsRouter.post(
     const dup = await one(`SELECT id FROM enrollments WHERE student_id=$1 AND course_id=$2`, [studentId, courseId]);
     if (dup) return bad(res, '该学员已报名此课程');
 
+    // ---- 校验1：年龄（老年大学 50-85 岁，舞蹈类 ≤80 岁） ----
+    const age = ageOf(student.birth_year);
+    const maxAge = course.category === '舞蹈' ? DANCE_AGE_MAX : AGE_MAX;
+    if (age < AGE_MIN || age > maxAge) {
+      return bad(res, `年龄校验未通过：学员${age}岁，${course.category}课程要求 ${AGE_MIN}-${maxAge} 岁`);
+    }
+    // ---- 校验2：兴趣班时间冲突 ----
+    const conflict = await findTimeConflict(studentId, course);
+    if (conflict) {
+      return bad(
+        res,
+        `兴趣班冲突：该学员已报「${conflict.title}」（周${'一二三四五六日'[conflict.weekday - 1]} ${conflict.start_time}-${conflict.end_time}），与本课程时间重叠`
+      );
+    }
+    // ---- 校验3：家属代办信息（代办则姓名/关系/电话须完整） ----
+    const proxyName = str(req.body.proxy_name);
+    const proxyRelation = str(req.body.proxy_relation);
+    const proxyPhone = str(req.body.proxy_phone);
+    const proxyParts = [proxyName, proxyRelation, proxyPhone].filter((x) => x).length;
+    if (proxyParts > 0 && proxyParts < 3) {
+      return bad(res, '家属代办信息不完整：代办人姓名、与学员关系、联系电话须同时填写');
+    }
+
     const result = await withTransaction(async (client) => {
       const confirmed = (
         await client.query(
@@ -56,6 +89,7 @@ enrollmentsRouter.post(
       ).rows[0].c;
       let status = '已录取';
       let position: number | null = null;
+      let seat: number | null = null;
       if (confirmed >= course.capacity) {
         status = '候补';
         position =
@@ -65,20 +99,27 @@ enrollmentsRouter.post(
               [courseId]
             )
           ).rows[0].p + 1;
+      } else {
+        seat = await assignSeat(courseId, client);
       }
       const r = await client.query(
-        `INSERT INTO enrollments(student_id, course_id, age, level, health_limits, source, fee_amount, fee_status, status, waitlist_position)
-         VALUES($1,$2,$3,$4,$5,$6,$7,'未缴',$8,$9) RETURNING *`,
+        `INSERT INTO enrollments(student_id, course_id, age, level, health_limits, source, fee_amount, fee_status,
+           status, waitlist_position, seat_no, proxy_name, proxy_relation, proxy_phone)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'未缴',$8,$9,$10,$11,$12,$13) RETURNING *`,
         [
           studentId,
           courseId,
-          ageOf(student.birth_year),
+          age,
           str(req.body.level, '零基础'),
           str(req.body.health_limits) || student.health_limits,
           str(req.body.source) || student.source,
           course.fee,
           status,
           position,
+          seat,
+          proxyName,
+          proxyRelation,
+          proxyPhone,
         ]
       );
       await audit(
@@ -86,7 +127,9 @@ enrollmentsRouter.post(
           entityType: 'enrollment',
           entityId: r.rows[0].id,
           action: '学员报名',
-          reason: status === '候补' ? `课程已满，进入候补队列第${position}位` : '报名并录取',
+          reason:
+            (status === '候补' ? `课程已满，进入候补队列第${position}位` : `报名并录取，座位${seat}号`) +
+            (proxyName ? `；家属代办：${proxyName}（${proxyRelation}）` : ''),
           actor: req.user!.name,
           courseId,
           studentId,
@@ -120,7 +163,7 @@ enrollmentsRouter.post(
   })
 );
 
-// 退课（已录取名额空出 → 自动候补转正；已缴费 → 自动生成退费申请）
+// 退课（空出名额 → 自动按候补顺序推送转正通知；已缴费 → 自动生成退费申请）
 enrollmentsRouter.post(
   '/:id/cancel',
   requireStaff,
@@ -131,8 +174,12 @@ enrollmentsRouter.post(
     if (!en) return bad(res, '报名记录不存在', 404);
     if (!['已录取', '候补'].includes(en.status)) return bad(res, `当前状态为「${en.status}」，不能退课`);
 
+    let offers: any[] = [];
     await withTransaction(async (client) => {
-      await client.query(`UPDATE enrollments SET status='已退课', waitlist_position=NULL WHERE id=$1`, [id]);
+      await client.query(
+        `UPDATE enrollments SET status='已退课', waitlist_position=NULL, seat_no=NULL WHERE id=$1`,
+        [id]
+      );
       await audit(
         {
           entityType: 'enrollment',
@@ -152,14 +199,100 @@ enrollmentsRouter.post(
         );
       }
       if (en.status === '已录取') {
-        await promoteNext(en.course_id, req.user!.name, client);
+        offers = await offerNextSeats(en.course_id, req.user!.name, `学员退课空出名额（${reason}）`, client);
       }
     });
-    res.json({ ok: true });
+    res.json({ ok: true, offers });
   })
 );
 
-// 候补转正（手动）
+// 长期请假（空出名额 → 自动推送转正通知）
+enrollmentsRouter.post(
+  '/:id/long-leave',
+  requireStaff,
+  h(async (req, res) => {
+    const id = num(req.params.id)!;
+    const reason = str(req.body.reason);
+    if (!reason) return bad(res, '请填写长期请假原因');
+    const en = await one<any>(`SELECT * FROM enrollments WHERE id=$1`, [id]);
+    if (!en) return bad(res, '报名记录不存在', 404);
+    if (en.status !== '已录取') return bad(res, '仅在读学员可标记长期请假');
+    let offers: any[] = [];
+    await withTransaction(async (client) => {
+      await client.query(`UPDATE enrollments SET status='长期请假', seat_no=NULL WHERE id=$1`, [id]);
+      await audit(
+        {
+          entityType: 'enrollment',
+          entityId: id,
+          action: '长期请假',
+          reason: `${reason}；名额临时空出，已按候补顺序推送转正通知`,
+          actor: req.user!.name,
+          courseId: en.course_id,
+          studentId: en.student_id,
+        },
+        client
+      );
+      offers = await offerNextSeats(en.course_id, req.user!.name, `学员长期请假空出名额（${reason}）`, client);
+    });
+    res.json({ ok: true, offers });
+  })
+);
+
+// 长期请假恢复（有名额则回座位，无名额则排到候补队尾）
+enrollmentsRouter.post(
+  '/:id/restore',
+  requireStaff,
+  h(async (req, res) => {
+    const id = num(req.params.id)!;
+    const en = await one<any>(`SELECT * FROM enrollments WHERE id=$1`, [id]);
+    if (!en) return bad(res, '报名记录不存在', 404);
+    if (en.status !== '长期请假') return bad(res, '该学员不在长期请假状态');
+    const course = await one<any>(`SELECT * FROM courses WHERE id=$1`, [en.course_id]);
+    const result = await withTransaction(async (client) => {
+      const confirmed = (
+        await client.query(`SELECT COUNT(*)::int AS c FROM enrollments WHERE course_id=$1 AND status='已录取'`, [
+          en.course_id,
+        ])
+      ).rows[0].c;
+      let status: string;
+      let seat: number | null = null;
+      let position: number | null = null;
+      if (confirmed < course.capacity) {
+        status = '已录取';
+        seat = await assignSeat(en.course_id, client);
+      } else {
+        status = '候补';
+        position =
+          (
+            await client.query(
+              `SELECT COALESCE(MAX(waitlist_position),0)::int AS p FROM enrollments WHERE course_id=$1 AND status='候补'`,
+              [en.course_id]
+            )
+          ).rows[0].p + 1;
+      }
+      await client.query(
+        `UPDATE enrollments SET status=$1, seat_no=$2, waitlist_position=$3 WHERE id=$4`,
+        [status, seat, position, id]
+      );
+      await audit(
+        {
+          entityType: 'enrollment',
+          entityId: id,
+          action: '长期请假恢复',
+          reason: status === '已录取' ? `恢复上课，座位${seat}号` : `课程已满，排到候补第${position}位`,
+          actor: req.user!.name,
+          courseId: en.course_id,
+          studentId: en.student_id,
+        },
+        client
+      );
+      return { status, seat, position };
+    });
+    res.json(result);
+  })
+);
+
+// 候补转正（手动）：热门课程禁止手工插队，须走转正通知流程
 enrollmentsRouter.post(
   '/:id/promote',
   requireStaff,
@@ -169,26 +302,35 @@ enrollmentsRouter.post(
     if (!en) return bad(res, '报名记录不存在', 404);
     if (en.status !== '候补') return bad(res, '仅候补状态可转正');
     const course = await one<any>(`SELECT * FROM courses WHERE id=$1`, [en.course_id]);
+    const waitlistCount = (
+      await one<any>(`SELECT COUNT(*)::int AS c FROM enrollments WHERE course_id=$1 AND status='候补'`, [
+        en.course_id,
+      ])
+    ).c;
+    if (waitlistCount >= HOT_WAITLIST_THRESHOLD) {
+      return bad(res, `该课程候补${waitlistCount}人，属热门课程：须通过「转正通知」按候补顺序推送录取，不能手工插队`, 403);
+    }
     const confirmed = await confirmedCount(en.course_id);
     const overrideReason = str(req.body.override_reason);
     if (confirmed >= course.capacity && !overrideReason) {
       return res.status(409).json({ error: '课程已满，如需破格录取请填写原因（如扩班）' });
     }
-    await one(`UPDATE enrollments SET status='已录取', waitlist_position=NULL WHERE id=$1`, [id]);
+    const seat = await assignSeat(en.course_id);
+    await one(`UPDATE enrollments SET status='已录取', waitlist_position=NULL, seat_no=$1 WHERE id=$2`, [seat, id]);
     await audit({
       entityType: 'enrollment',
       entityId: id,
       action: '候补转正',
-      reason: overrideReason ? `破格录取：${overrideReason}` : '工作人员手动转正',
+      reason: (overrideReason ? `破格录取：${overrideReason}` : '工作人员手动转正') + (seat ? `，座位${seat}号` : '，超出容量，座位待安排'),
       actor: req.user!.name,
       courseId: en.course_id,
       studentId: en.student_id,
     });
-    res.json({ ok: true });
+    res.json({ ok: true, seat_no: seat });
   })
 );
 
-// 报名时间线：请假/停课/转班/材料消耗/退费/补课原因一览（处理退费、补课、续报时溯源）
+// 报名时间线：请假/停课/转班/材料消耗/退费/补课/转正通知 原因一览
 enrollmentsRouter.get(
   '/:id/timeline',
   h(async (req, res) => {
@@ -200,7 +342,7 @@ enrollmentsRouter.get(
       [id]
     );
     if (!en) return bad(res, '报名记录不存在', 404);
-    const [attendances, leaves, makeups, refunds, transfers, audits, materialLogs, cancelledSessions] =
+    const [attendances, leaves, makeups, refunds, transfers, audits, materialLogs, cancelledSessions, offers] =
       await Promise.all([
         query(
           `SELECT a.*, s.session_no, s.session_date::text, s.is_makeup_session FROM attendances a
@@ -231,8 +373,9 @@ enrollmentsRouter.get(
            WHERE course_id=$1 AND status='已停课' ORDER BY session_date`,
           [en.course_id]
         ),
+        query(`SELECT * FROM promotion_offers WHERE enrollment_id=$1 ORDER BY offered_at`, [id]),
       ]);
-    res.json({ enrollment: en, attendances, leaves, makeups, refunds, transfers, audits, materialLogs, cancelledSessions });
+    res.json({ enrollment: en, attendances, leaves, makeups, refunds, transfers, audits, materialLogs, cancelledSessions, offers });
   })
 );
 
@@ -624,10 +767,18 @@ transfersRouter.post(
       [en.student_id, toCourseId]
     );
     if (dup) return bad(res, '该学员已报名目标课程');
+    // 转班同样校验兴趣班时间冲突
+    const conflict = await findTimeConflict(en.student_id, toCourse);
+    if (conflict) {
+      return bad(res, `兴趣班冲突：该学员已报「${conflict.title}」，与目标课程时间重叠`);
+    }
 
     const result = await withTransaction(async (client) => {
-      // 原报名 → 已转班
-      await client.query(`UPDATE enrollments SET status='已转班', waitlist_position=NULL WHERE id=$1`, [enrollmentId]);
+      // 原报名 → 已转班（释放座位）
+      await client.query(
+        `UPDATE enrollments SET status='已转班', waitlist_position=NULL, seat_no=NULL WHERE id=$1`,
+        [enrollmentId]
+      );
       // 目标课程名额判断
       const confirmed = (
         await client.query(
@@ -637,6 +788,7 @@ transfersRouter.post(
       ).rows[0].c;
       let status = '已录取';
       let position: number | null = null;
+      let seat: number | null = null;
       if (confirmed >= toCourse.capacity) {
         status = '候补';
         position =
@@ -646,11 +798,13 @@ transfersRouter.post(
               [toCourseId]
             )
           ).rows[0].p + 1;
+      } else {
+        seat = await assignSeat(toCourseId, client);
       }
       const student = (await client.query(`SELECT * FROM students WHERE id=$1`, [en.student_id])).rows[0];
       const newEn = await client.query(
-        `INSERT INTO enrollments(student_id, course_id, age, level, health_limits, source, fee_amount, fee_status, status, waitlist_position)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        `INSERT INTO enrollments(student_id, course_id, age, level, health_limits, source, fee_amount, fee_status, status, waitlist_position, seat_no)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
         [
           en.student_id,
           toCourseId,
@@ -662,6 +816,7 @@ transfersRouter.post(
           en.fee_status === '已缴' ? '已缴' : '未缴',
           status,
           position,
+          seat,
         ]
       );
       const tr = await client.query(
@@ -669,9 +824,9 @@ transfersRouter.post(
          VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
         [enrollmentId, newEn.rows[0].id, en.course_id, toCourseId, reason, req.user!.name]
       );
-      // 原课程空出名额 → 候补转正
+      // 原课程空出名额 → 推送转正通知
       if (en.status === '已录取') {
-        await promoteNext(en.course_id, req.user!.name, client);
+        await offerNextSeats(en.course_id, req.user!.name, `学员转班空出名额（${reason}）`, client);
       }
       await audit(
         {

@@ -3,6 +3,7 @@ import { query, one } from '../db';
 import { h, bad, str, num } from '../helpers';
 import { requireStaff } from '../auth';
 import { audit } from '../audit';
+import { expireStaleOffersGlobal } from '../domain';
 
 export const analysisRouter = Router();
 
@@ -10,6 +11,7 @@ export const analysisRouter = Router();
 analysisRouter.get(
   '/overview',
   h(async (_req, res) => {
+    await expireStaleOffersGlobal();
     const [
       students,
       activeCourses,
@@ -17,6 +19,7 @@ analysisRouter.get(
       pendingRefunds,
       pendingMakeups,
       waitlistTotal,
+      pendingOffers,
       materialWarnings,
       recentAudits,
     ] = await Promise.all([
@@ -26,6 +29,7 @@ analysisRouter.get(
       one(`SELECT COUNT(*)::int AS c FROM refunds WHERE status='待审核'`),
       one(`SELECT COUNT(*)::int AS c FROM makeups WHERE status='待安排'`),
       one(`SELECT COUNT(*)::int AS c FROM enrollments WHERE status='候补'`),
+      one(`SELECT COUNT(*)::int AS c FROM promotion_offers WHERE status='待确认'`),
       query(
         `SELECT m.*, c.title AS course_title,
            (m.per_student_qty * (SELECT COUNT(*) FROM enrollments e WHERE e.course_id=m.course_id AND e.status='已录取'))::numeric(10,2) AS need
@@ -42,6 +46,7 @@ analysisRouter.get(
       pendingRefunds: pendingRefunds.c,
       pendingMakeups: pendingMakeups.c,
       waitlistTotal: waitlistTotal.c,
+      pendingOffers: pendingOffers.c,
       materialWarnings,
       recentAudits,
     });

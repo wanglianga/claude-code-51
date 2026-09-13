@@ -79,6 +79,7 @@ const cards = computed(() => [
   { label: '待审批请假', value: overview.value.pendingLeaves ?? '-', color: '#e6a23c' },
   { label: '待审核退费', value: overview.value.pendingRefunds ?? '-', color: '#f56c6c' },
   { label: '待安排补课', value: overview.value.pendingMakeups ?? '-', color: '#909399' },
+  { label: '待确认转正', value: overview.value.pendingOffers ?? '-', color: '#7b5cbf' },
   { label: '候补总人数', value: overview.value.waitlistTotal ?? '-', color: '#b88230' },
 ]);
 

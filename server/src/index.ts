@@ -16,6 +16,7 @@ import {
   transfersRouter,
 } from './routes/enrollments';
 import { eventsRouter } from './routes/events';
+import { offersRouter } from './routes/offers';
 import { analysisRouter } from './routes/analysis';
 
 async function waitForDb(retries = 30) {
@@ -67,6 +68,7 @@ async function main() {
   app.use('/api/refunds', requireAuth, refundsRouter);
   app.use('/api/transfers', requireAuth, transfersRouter);
   app.use('/api/events', requireAuth, eventsRouter);
+  app.use('/api/offers', requireAuth, offersRouter);
   app.use('/api/analysis', requireAuth, analysisRouter);
 
   // 生产模式：托管前端构建产物（SPA 回退）

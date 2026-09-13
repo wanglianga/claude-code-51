@@ -142,7 +142,7 @@ export async function seedIfEmpty() {
     [11, CALLIG, '零基础', '已缴', '已录取', null, '2026-08-21 11:00'],
     [13, CALLIG, '零基础', '已缴', '已录取', null, '2026-08-22 09:00'],
     [15, CALLIG, '零基础', '已缴', '已录取', null, '2026-08-22 09:30'],
-    [16, CALLIG, '初级', '已缴', '已录取', null, '2026-08-22 10:00'],
+    [16, CALLIG, '初级', '已缴', '长期请假', null, '2026-08-22 10:00'], // 沈万山 长期请假，名额空出
     [17, CALLIG, '零基础', '已缴', '已录取', null, '2026-08-23 09:00'],
     [18, CALLIG, '零基础', '已缴', '已录取', null, '2026-08-23 09:30'],
     [4, CALLIG, '零基础', '已缴', '已录取', null, '2026-08-23 10:00'],
@@ -227,6 +227,52 @@ export async function seedIfEmpty() {
       [r[0].id, status === '候补' ? `课程已满，进入候补队列第${wp}位` : '报名并录取', cid, sid, createdAt]
     );
   }
+
+  // ---------- 座位号分配（已录取学员按报名顺序） ----------
+  for (const cid of [CALLIG, VOCAL, DANCE, PHOTO, HEALTH, SUMMER]) {
+    const enrolled = await query<any>(
+      `SELECT id FROM enrollments WHERE course_id=$1 AND status='已录取' ORDER BY id`,
+      [cid]
+    );
+    for (let i = 0; i < enrolled.length; i++) {
+      await query(`UPDATE enrollments SET seat_no=$1 WHERE id=$2`, [i + 1, enrolled[i].id]);
+    }
+  }
+
+  // ---------- 家属代办信息示例 ----------
+  await query(
+    `UPDATE enrollments SET proxy_name='褚阳', proxy_relation='子女', proxy_phone='13811110013' WHERE id=$1`,
+    [enrollId['13-' + CALLIG]]
+  );
+
+  // ---------- 长期请假（沈万山）与候补转正通知流水 ----------
+  await query(
+    `INSERT INTO audit_logs(entity_type, entity_id, action, reason, actor, course_id, student_id, created_at)
+     VALUES('enrollment',$1,'长期请假','去外地子女家休养两个月，名额临时空出','王敏',$2,16,'2026-09-06 10:00')`,
+    [enrollId['16-' + CALLIG], CALLIG]
+  );
+  // 候补第1位孙德福：已顺延（原因保留，自动顺延下一位）
+  await query(
+    `INSERT INTO promotion_offers(course_id, enrollment_id, student_id, queue_position, level, status, reason, note, offered_by, offered_at, responded_at, expires_at)
+     VALUES($1,$2,8,1,'零基础','已顺延','子女接去外地休养，本月无法到校确认','沈万山长期请假空出名额','王敏','2026-09-10 10:00','2026-09-11 09:00','2026-09-12 10:00')`,
+    [CALLIG, enrollId['8-' + CALLIG]]
+  );
+  await query(
+    `INSERT INTO audit_logs(entity_type, entity_id, action, reason, actor, course_id, student_id, created_at)
+     VALUES('offer',1,'转正未确认顺延','子女接去外地休养，本月无法到校确认','王敏',$1,8,'2026-09-11 09:00')`,
+    [CALLIG]
+  );
+  // 候补第2位吴永强：待确认（演示确认/顺延操作）
+  await query(
+    `INSERT INTO promotion_offers(course_id, enrollment_id, student_id, queue_position, level, status, note, offered_by, offered_at, expires_at)
+     VALUES($1,$2,10,2,'零基础','待确认','沈万山长期请假空出名额','王敏',now(),now() + INTERVAL '48 hours')`,
+    [CALLIG, enrollId['10-' + CALLIG]]
+  );
+  await query(
+    `INSERT INTO audit_logs(entity_type, entity_id, action, reason, actor, course_id, student_id, created_at)
+     VALUES('offer',2,'推送转正通知','沈万山长期请假空出名额；候补第2位，基础水平：零基础','王敏',$1,10,'2026-09-11 10:00')`,
+    [CALLIG]
+  );
 
   // ---------- 考勤 ----------
   const att = async (

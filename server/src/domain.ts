@@ -3,6 +3,15 @@ import { query, one } from './db';
 import { audit } from './audit';
 import { weeklyDates, currentYear } from './helpers';
 
+/** 报名年龄规则：老年大学 50-85 岁，舞蹈类课程因身体要求上限 80 岁 */
+export const AGE_MIN = 50;
+export const AGE_MAX = 85;
+export const DANCE_AGE_MAX = 80;
+/** 候补人数达到该值视为热门课程，禁止手工插队 */
+export const HOT_WAITLIST_THRESHOLD = 3;
+/** 转正通知确认时限（小时） */
+export const OFFER_EXPIRE_HOURS = 48;
+
 /** 计算课程已录取人数 */
 export async function confirmedCount(courseId: number, client?: PoolClient): Promise<number> {
   const sql = `SELECT COUNT(*)::int AS c FROM enrollments WHERE course_id=$1 AND status='已录取'`;
@@ -10,43 +19,6 @@ export async function confirmedCount(courseId: number, client?: PoolClient): Pro
     ? (await client.query(sql, [courseId])).rows[0]
     : await one(sql, [courseId]);
   return row?.c ?? 0;
-}
-
-/** 候补转正：取候补队列第一位转为已录取 */
-export async function promoteNext(courseId: number, actor: string, client?: PoolClient) {
-  const run = async (q: <T = any>(t: string, p?: any[]) => Promise<T[]>) => {
-    const next = (
-      await q<any>(
-        `SELECT * FROM enrollments WHERE course_id=$1 AND status='候补'
-         ORDER BY waitlist_position NULLS LAST, id LIMIT 1`,
-        [courseId]
-      )
-    )[0];
-    if (!next) return null;
-    await q(`UPDATE enrollments SET status='已录取', waitlist_position=NULL WHERE id=$1`, [next.id]);
-    return next;
-  };
-  let promoted: any = null;
-  if (client) {
-    promoted = await run(async (t, p) => (await client.query(t, p)).rows);
-  } else {
-    promoted = await run((t, p) => query(t, p));
-  }
-  if (promoted) {
-    await audit(
-      {
-        entityType: 'enrollment',
-        entityId: promoted.id,
-        action: '候补转正',
-        reason: '课程出现空余名额，按候补顺序录取',
-        actor,
-        courseId,
-        studentId: promoted.student_id,
-      },
-      client
-    );
-  }
-  return promoted;
 }
 
 /** 生成课次：自 start_date 起每周一次 */
@@ -83,6 +55,166 @@ export async function roomConflict(
     ? (await client.query(sql, [roomId, date, start, end])).rows[0]
     : await one(sql, [roomId, date, start, end]);
   return row ? row.title : null;
+}
+
+/** 课程上课日期范围 [首日, 末日] */
+export function courseRange(course: any): [string, string] {
+  const dates = weeklyDates(course.start_date, course.total_sessions);
+  return [dates[0], dates[dates.length - 1]];
+}
+
+/** 兴趣班冲突检测：同学员已录取/长期请假课程中，与目标课程同星期、时段重叠且日期范围重叠者 */
+export async function findTimeConflict(
+  studentId: number,
+  targetCourse: any,
+  client?: PoolClient
+): Promise<any | null> {
+  const sql = `SELECT c.* FROM enrollments e JOIN courses c ON c.id=e.course_id
+               WHERE e.student_id=$1 AND e.status IN ('已录取','长期请假') AND c.id<>$2
+                 AND c.status IN ('报名中','已开班')`;
+  const rows = client
+    ? (await client.query(sql, [studentId, targetCourse.id])).rows
+    : await query(sql, [studentId, targetCourse.id]);
+  const [tStart, tEnd] = courseRange(targetCourse);
+  for (const c of rows) {
+    if (c.weekday !== targetCourse.weekday) continue;
+    if (c.end_time <= targetCourse.start_time || c.start_time >= targetCourse.end_time) continue;
+    const [cStart, cEnd] = courseRange(c);
+    if (cEnd < tStart || cStart > tEnd) continue;
+    return c;
+  }
+  return null;
+}
+
+/** 分配座位号：课程容量内最小空闲号，无空位返回 null */
+export async function assignSeat(courseId: number, client?: PoolClient): Promise<number | null> {
+  const run = async <T = any>(text: string, params?: any[]): Promise<T[]> =>
+    client ? (await client.query(text, params)).rows : query<T>(text, params);
+  const course = (await run<any>(`SELECT capacity FROM courses WHERE id=$1`, [courseId]))[0];
+  if (!course) return null;
+  const used = new Set(
+    (
+      await run<any>(
+        `SELECT seat_no FROM enrollments WHERE course_id=$1 AND status='已录取' AND seat_no IS NOT NULL`,
+        [courseId]
+      )
+    ).map((r) => r.seat_no)
+  );
+  for (let i = 1; i <= course.capacity; i++) {
+    if (!used.has(i)) return i;
+  }
+  return null;
+}
+
+/** 候补候选人名单：按候补顺序，标注时间冲突/已顺延记录/待确认通知，给出是否可推送 */
+export async function waitlistCandidates(courseId: number, client?: PoolClient) {
+  const run = async <T = any>(text: string, params?: any[]): Promise<T[]> =>
+    client ? (await client.query(text, params)).rows : query<T>(text, params);
+  const course = (await run<any>(`SELECT * FROM courses WHERE id=$1`, [courseId]))[0];
+  if (!course) return [];
+  const rows = await run<any>(
+    `SELECT e.*, s.name AS student_name FROM enrollments e JOIN students s ON s.id=e.student_id
+     WHERE e.course_id=$1 AND e.status='候补' ORDER BY e.waitlist_position NULLS LAST, e.id`,
+    [courseId]
+  );
+  const out = [];
+  for (const en of rows) {
+    const conflict = await findTimeConflict(en.student_id, course, client);
+    const declined = (
+      await run<any>(
+        `SELECT reason, status FROM promotion_offers WHERE enrollment_id=$1 AND status IN ('已顺延','已过期')
+         ORDER BY id DESC LIMIT 1`,
+        [en.id]
+      )
+    )[0];
+    const pending = (
+      await run<any>(`SELECT id FROM promotion_offers WHERE enrollment_id=$1 AND status='待确认'`, [en.id])
+    )[0];
+    out.push({
+      enrollment: en,
+      timeConflict: conflict
+        ? { title: conflict.title, weekday: conflict.weekday, start_time: conflict.start_time, end_time: conflict.end_time }
+        : null,
+      declinedBefore: declined ? declined.reason || declined.status : '',
+      hasPendingOffer: !!pending,
+      eligible: !conflict && !declined && !pending,
+    });
+  }
+  return out;
+}
+
+/** 将本课程过期的待确认通知标记为已过期（保留原因） */
+async function expireOffersRaw(courseId: number, client?: PoolClient) {
+  const sql = `UPDATE promotion_offers SET status='已过期', reason='超过48小时未确认，自动顺延', responded_at=now()
+               WHERE course_id=$1 AND status='待确认' AND expires_at < now()`;
+  if (client) await client.query(sql, [courseId]);
+  else await query(sql, [courseId]);
+}
+
+/**
+ * 按候补顺序、可上课时间推送转正通知（基础水平随通知快照展示）。
+ * 每出现一个空位推送一位；已被顺延/过期、时间冲突、已有待确认通知者自动跳过（原因保留可查）。
+ */
+export async function offerNextSeats(
+  courseId: number,
+  actor: string,
+  note: string,
+  client?: PoolClient
+): Promise<any[]> {
+  const run = async <T = any>(text: string, params?: any[]): Promise<T[]> =>
+    client ? (await client.query(text, params)).rows : query<T>(text, params);
+  await expireOffersRaw(courseId, client);
+  const course = (await run<any>(`SELECT * FROM courses WHERE id=$1`, [courseId]))[0];
+  if (!course || !['报名中', '已开班'].includes(course.status)) return [];
+  const confirmed = await confirmedCount(courseId, client);
+  const pending = (
+    await run<any>(
+      `SELECT COUNT(*)::int AS c FROM promotion_offers WHERE course_id=$1 AND status='待确认'`,
+      [courseId]
+    )
+  )[0].c;
+  let needed = course.capacity - confirmed - pending;
+  if (needed <= 0) return [];
+
+  const candidates = await waitlistCandidates(courseId, client);
+  const created: any[] = [];
+  for (const cand of candidates) {
+    if (needed <= 0) break;
+    if (!cand.eligible) continue;
+    const en = cand.enrollment;
+    const rows = await run<any>(
+      `INSERT INTO promotion_offers(course_id, enrollment_id, student_id, queue_position, level, note, offered_by, expires_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7, now() + INTERVAL '48 hours') RETURNING *`,
+      [courseId, en.id, en.student_id, en.waitlist_position, en.level, note, actor]
+    );
+    await audit(
+      {
+        entityType: 'offer',
+        entityId: rows[0].id,
+        action: '推送转正通知',
+        reason: `${note}；候补第${en.waitlist_position}位，基础水平：${en.level}`,
+        actor,
+        courseId,
+        studentId: en.student_id,
+      },
+      client
+    );
+    created.push(rows[0]);
+    needed--;
+  }
+  return created;
+}
+
+/** 全局过期处理（列表/总览前调用），过期后自动为对应课程顺延下一位 */
+export async function expireStaleOffersGlobal() {
+  const rows = await query<any>(
+    `UPDATE promotion_offers SET status='已过期', reason='超过48小时未确认，自动顺延', responded_at=now()
+     WHERE status='待确认' AND expires_at < now() RETURNING course_id`
+  );
+  const ids = [...new Set(rows.map((r) => r.course_id))];
+  for (const cid of ids) {
+    await offerNextSeats(cid as number, '系统', '前序通知过期自动顺延');
+  }
 }
 
 /** 结课时生成/刷新学员学习记录（出勤、补课、教师评价、退费、续报名建议） */

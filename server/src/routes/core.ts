@@ -34,7 +34,7 @@ authRouter.get('/me', requireAuth, (req, res) => res.json({ user: req.user }));
 
 // ---------------- 下拉选项 ----------------
 coreRouter.get(
-  '/options',
+  '/meta/options',
   h(async (_req, res) => {
     const [rooms, teachers, terms] = await Promise.all([
       query(`SELECT id, name, room_type, capacity FROM rooms ORDER BY id`),
